@@ -9,6 +9,11 @@ from typing import Dict, Generic, Optional, TypeVar
 
 import attr
 import cairo
+import gi
+
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Pango, PangoCairo
 
 from bbb_presentation_video.events import (
     CursorEvent,
@@ -31,6 +36,9 @@ CURSOR_OPACITY = 0.6
 CURSOR_PRESENTER = Color.from_int(0xFF0000, CURSOR_OPACITY)
 CURSOR_OTHER = Color.from_int(0x2A992A, CURSOR_OPACITY)
 CURSOR_RADIUS = 0.005  # 6px on 960x720
+CURSOR_LABEL_FONT = "Arial"
+CURSOR_LABEL_OPACITY = 0.85
+CURSOR_LABEL_MAX_LENGTH = 40
 
 CairoSomeSurface = TypeVar("CairoSomeSurface", bound=cairo.Surface)
 
@@ -244,6 +252,13 @@ class CursorRenderer(Generic[CairoSomeSurface]):
             ctx.fill()
             ctx.restore()
 
+        # With more than one cursor on the slide, each one gets the name of
+        # its user, as in the meeting
+        show_labels = (
+            sum(1 for cursor in self.cursors.values() if cursor.position is not None)
+            > 1
+        )
+
         for user_id, cursor in self.cursors.items():
             if cursor.position is None:
                 continue
@@ -271,12 +286,56 @@ class CursorRenderer(Generic[CairoSomeSurface]):
                 ctx.set_source_rgba(*CURSOR_OTHER)
                 ctx.set_operator(cairo.OPERATOR_DEST_OVER)
             ctx.fill()
+
+            if show_labels and cursor.label:
+                # Back to output pixels, so the name has the same size on any slide
+                ctx.scale(
+                    1 / transform.shapes_scale / transform.scale,
+                    1 / transform.shapes_scale / transform.scale,
+                )
+                self.draw_label(cursor.label, user_id == self.presenter)
             ctx.restore()
 
         self.pattern = ctx.pop_group()
 
         self.cursors_changed = False
         return True
+
+    def draw_label(self, label: str, presenter: bool) -> None:
+        """The name of the user, on a tag below and to the right of the cursor."""
+        ctx = self.ctx
+        font_size = max(10.0, self.radius * 1.9)
+        layout = PangoCairo.create_layout(ctx)
+        font = Pango.FontDescription()
+        font.set_family(CURSOR_LABEL_FONT)
+        font.set_weight(Pango.Weight.SEMIBOLD)
+        font.set_absolute_size(int(font_size * Pango.SCALE))
+        layout.set_font_description(font)
+        layout.set_text(label[:CURSOR_LABEL_MAX_LENGTH], -1)
+        _ink, logical = layout.get_pixel_extents()
+
+        padding_x = font_size * 0.45
+        padding_y = font_size * 0.15
+        x = self.radius * 1.2
+        y = self.radius * 1.2
+        width = logical.width + 2 * padding_x
+        height = logical.height + 2 * padding_y
+        corner = min(height / 2, font_size * 0.35)
+
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        ctx.new_sub_path()
+        ctx.arc(x + width - corner, y + corner, corner, -pi / 2, 0)
+        ctx.arc(x + width - corner, y + height - corner, corner, 0, pi / 2)
+        ctx.arc(x + corner, y + height - corner, corner, pi / 2, pi)
+        ctx.arc(x + corner, y + corner, corner, pi, pi * 3 / 2)
+        ctx.close_path()
+        color = CURSOR_PRESENTER if presenter else CURSOR_OTHER
+        ctx.set_source_rgba(color.r, color.g, color.b, CURSOR_LABEL_OPACITY)
+        ctx.fill()
+
+        ctx.move_to(x + padding_x, y + padding_y)
+        ctx.set_source_rgb(1, 1, 1)
+        PangoCairo.show_layout(ctx, layout)
 
     def render(self) -> None:
         if self.pattern:
