@@ -457,16 +457,18 @@ def is_jumbomoji(text: str) -> bool:
 
 
 _HREF = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.I)
-_URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 
 
 def first_link(message: str) -> str:
-    """The first link of a chat message (as stored, in HTML), if any."""
-    match = _HREF.search(message)
-    if match is not None and match.group(1).lower().startswith(("http://", "https://")):
-        return html.unescape(match.group(1))
-    match = _URL.search(html.unescape(_TAG.sub(" ", message)))
-    return match.group(0).rstrip(".,;:!?)") if match is not None else ""
+    """The first link of a chat message (as stored, in HTML), if any.
+
+    Only what the meeting stored as a link counts, which is also what the
+    playback of the presentation format shows as one.
+    """
+    for match in _HREF.finditer(message):
+        if match.group(1).lower().startswith(("http://", "https://")):
+            return html.unescape(match.group(1))
+    return ""
 
 
 def _talk_intervals(raw: List[TalkInterval]) -> List[TalkInterval]:
