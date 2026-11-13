@@ -662,15 +662,26 @@ class OverlayRenderer:
             ctx.restore()
             width -= logo_w + 16
 
-        title = self._layout(
-            ctx, self.events.meeting_name, 21, 700, width=width, lines=2
-        )
+        # A long name gets a smaller font to fit in two lines, and is cut after that
+        for size in (21, 19.5, 18, 16.5, 15):
+            title = self._layout(
+                ctx, self.events.meeting_name, size, 700, width=width, lines=2
+            )
+            if not title.is_ellipsized():
+                break
         _title_w, title_h = self._size(title)
-        self._show(ctx, title, bar.x + 4, bar.y - 3, TEXT)
+        title_y = bar.y - 3
+        below_logo = 0.0
+        if self.logo is not None:
+            # The date and the elapsed time always go below the logo
+            below_logo = self.logo_height + 10
+            if title.get_line_count() == 1:
+                title_y = bar.y + (self.logo_height - title_h) / 2
+        self._show(ctx, title, bar.x + 4, title_y, TEXT)
 
         when_layout = self._layout(ctx, self.date, 16.5, 500)
         _when_w, when_h = self._size(when_layout)
-        when_y = bar.y - 3 + title_h + 6
+        when_y = max(title_y + title_h + 6, bar.y + below_logo)
         self._show(ctx, when_layout, bar.x + 4, when_y, TEXT, 0.68)
         # Elapsed time of the recording, on the right of the same line
         self._draw_elapsed(clock, bar.x + bar.width, when_y + when_h / 2, True)
