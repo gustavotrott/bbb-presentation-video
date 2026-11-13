@@ -71,7 +71,8 @@ class ActivityItem:
 
     # "chat", "poll", "external_video", "present" (who was already in the
     # meeting when the recording started), or one of the one-line entries:
-    # "join", "leave", "raise_hand", "reaction" and "chat_clear"
+    # "join", "leave", "raise_hand", "reaction", "chat_clear" and "pause" (the
+    # recording was paused and resumed)
     kind: str
     timestamp: float
     user_id: Optional[str] = None
@@ -93,6 +94,8 @@ class ActivityItem:
     emphasized: bool = False
     # Present: the names of who was in the meeting, moderators first
     names: List[str] = field(default_factory=list)
+    # Pause: when the recording was paused and when it was resumed
+    paused: Optional[Tuple[float, float]] = None
 
     def reactions_at(self, timestamp: float) -> Tuple[Tuple[str, int], ...]:
         """Emoji and count of the reactions at the timestamp, as the client
@@ -536,13 +539,15 @@ def _recording_start_items(
     What happens while the meeting is not being recorded is left out of the
     video, and with it the entries of who joined before the recording started.
     A single entry at the start of the recording lists them instead. When the
-    recording is paused and resumed, who came or went in the meantime is shown
-    as joining or leaving at the moment it is resumed.
+    recording is paused and resumed, an entry tells for how long, and who came
+    or went in the meantime is shown as joining or leaving at the moment it is
+    resumed.
     """
     items: List[ActivityItem] = []
     present: Dict[str, Tuple[str, str]] = {}
     position = 0
     previous: Optional[Dict[str, Tuple[str, str]]] = None
+    paused_at = 0.0
     for start, end in record_intervals:
         for check in (start, end):
             while position < len(transitions) and transitions[position][0] < check:
@@ -554,6 +559,7 @@ def _recording_start_items(
                 position += 1
             if check == end:
                 previous = dict(present)
+                paused_at = end
             elif previous is None:
                 if present:
                     people = sorted(
@@ -569,6 +575,7 @@ def _recording_start_items(
                         )
                     )
             else:
+                items.append(ActivityItem("pause", start, paused=(paused_at, start)))
                 for person, (user_id, name) in present.items():
                     if person not in previous:
                         items.append(ActivityItem("join", start, user_id, name))

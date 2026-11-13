@@ -72,9 +72,14 @@ AREA_RADIUS = 12
 TILE_RADIUS = 10
 # How long a new timeline entry takes to slide in, in seconds
 ENTER_DURATION = 0.35
-COMPACT_KINDS = ("join", "leave", "raise_hand", "reaction", "chat_clear")
+COMPACT_KINDS = ("join", "leave", "raise_hand", "reaction", "chat_clear", "pause")
 PRESENCE_KINDS = ("join", "leave")
-PRESENT_LINES = 8
+# Lines left free in the session activity below the entry of who was in the
+# meeting, so that it does not look like the list was cut by the lack of space
+PRESENT_MARGIN_LINES = 2
+# Session activity: height of the title and space around the entries
+ACTIVITY_HEADER = 58
+ACTIVITY_PADDING = 16
 
 STRINGS: Dict[str, Dict[str, Any]] = {
     "en": {
@@ -94,6 +99,8 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "chat_clear": "The public chat was cleared",
         "present": "IN THE MEETING AS THE RECORDING STARTS",
         "and_more": ("and {n} more", "and {n} more"),
+        "pause": "Recording paused from {start} to {end}",
+        "pause_for": "Recording paused for {duration}",
         "pinned_by": "Pinned by {name}",
         "pinned": "Pinned message",
         "timer": "Timer",
@@ -121,6 +128,8 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "chat_clear": "O chat público foi limpo",
         "present": "NA SALA NO INÍCIO DA GRAVAÇÃO",
         "and_more": ("e mais {n}", "e mais {n}"),
+        "pause": "Gravação pausada das {start} às {end}",
+        "pause_for": "Gravação pausada por {duration}",
         "pinned_by": "Fixada por {name}",
         "pinned": "Mensagem fixada",
         "timer": "Temporizador",
@@ -170,6 +179,17 @@ def initials(name: str) -> str:
     if len(words) == 1:
         return words[0][:2].upper()
     return (words[0][0] + words[1][0]).upper()
+
+
+def format_duration(seconds: float) -> str:
+    """A length of time in a few words: 40 s, 12 min, 1 h 05 min."""
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f"{total} s"
+    minutes = int(round(total / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60:02d} min"
 
 
 def format_clock(seconds: float) -> str:
@@ -284,8 +304,9 @@ class OverlayRenderer:
         self.content_area = content[0] if content else None
         self.external_video_notice = bool(config.get("external_video_notice", True))
         self.show_timer = bool(config.get("timer", True))
-        # Lines of names in the entry of who was there when the recording started
-        self.present_lines = max(1, int(config.get("present_lines", PRESENT_LINES)))
+        # Lines of names in the entry of who was there when the recording
+        # started; 0 for as many as fit in the session activity
+        self.present_lines = max(0, int(config.get("present_lines") or 0))
         self.webcams = [
             (str(tile.get("user_id") or ""), Rect.from_config(tile, scale))
             for tile in config.get("webcams", [])
@@ -440,18 +461,18 @@ class OverlayRenderer:
         return str(singular if n == 1 else plural).format(n=n)
 
     def _format_date(self, timezone_name: Optional[str]) -> str:
-        start = self.events.recording_start_utc()
-        if start is None:
-            return ""
-        tz = None
+        self.tz = None
         if timezone_name:
             try:
                 from zoneinfo import ZoneInfo
 
-                tz = ZoneInfo(str(timezone_name))
+                self.tz = ZoneInfo(str(timezone_name))
             except Exception:
-                tz = None
-        date = datetime.fromtimestamp(start, timezone.utc).astimezone(tz)
+                self.tz = None
+        start = self.events.recording_start_utc()
+        if start is None:
+            return ""
+        date = datetime.fromtimestamp(start, timezone.utc).astimezone(self.tz)
         months = self.strings["months"]
         day = str(self.strings["date"]).format(
             day=date.day,
@@ -971,7 +992,7 @@ class OverlayRenderer:
         if panel.width <= 0 or panel.height <= 0:
             return
         ctx = self.ctx
-        header_h = 58
+        header_h = ACTIVITY_HEADER
 
         rounded_rect(ctx, panel.x, panel.y, panel.width, panel.height, AREA_RADIUS)
         ctx.set_source_rgb(*self.panel)
@@ -1001,7 +1022,7 @@ class OverlayRenderer:
         ctx.fill()
 
         # The timeline grows from the bottom; older entries scroll out at the top
-        padding = 16
+        padding = ACTIVITY_PADDING
         list_top = panel.y + header_h + 1
         list_bottom = panel.y + panel.height - padding
         item_x = panel.x + padding
@@ -1202,6 +1223,8 @@ class OverlayRenderer:
             height = self._draw_presence(ctx, item, width, clock)
         elif item.kind == "present":
             height = self._draw_present(ctx, item, width, clock)
+        elif item.kind == "pause":
+            height = self._draw_pause(ctx, item, width, clock)
         elif item.kind in COMPACT_KINDS:
             height = self._draw_compact(ctx, item, width, clock)
         else:
@@ -1444,6 +1467,44 @@ class OverlayRenderer:
         self._show(ctx, action, text_x + name_w + 6, middle - action_h / 2, MUTED)
         return height
 
+    def _draw_pause(
+        self, ctx: "cairo.Context[Any]", item: ActivityItem, width: float, clock: str
+    ) -> float:
+        """The recording was paused: when it stopped and when it came back."""
+        height = 26.0
+        icon = 36.0
+        text_x = icon + 14
+        middle = height / 2
+
+        ctx.set_source_rgb(*AMBER)
+        for offset in (-4.5, 1.5):
+            rounded_rect(ctx, icon / 2 + offset, middle - 6, 3, 12, 1)
+            ctx.fill()
+
+        when = self._layout(ctx, clock, 12.5, 400)
+        when_w, when_h = self._size(when)
+        self._show(ctx, when, width - when_w, middle - when_h / 2, MUTED)
+
+        paused_at, resumed_at = item.paused or (item.timestamp, item.timestamp)
+        start_utc = self.events.start_utc
+        if start_utc is None:
+            text = str(self.strings["pause_for"]).format(
+                duration=format_duration(resumed_at - paused_at)
+            )
+        else:
+            text = str(self.strings["pause"]).format(
+                start=self._time_of_day(start_utc + paused_at),
+                end=self._time_of_day(start_utc + resumed_at),
+            )
+        label = self._layout(ctx, text, 14.5, 600, width=width - text_x - when_w - 12)
+        _label_w, label_h = self._size(label)
+        self._show(ctx, label, text_x, middle - label_h / 2, TEXT_SOFT)
+        return height
+
+    def _time_of_day(self, utc: float) -> str:
+        date = datetime.fromtimestamp(utc, timezone.utc).astimezone(self.tz)
+        return f"{date.hour:02d}:{date.minute:02d}"
+
     def _card_header(
         self,
         ctx: "cairo.Context[Any]",
@@ -1520,23 +1581,37 @@ class OverlayRenderer:
         self._show(ctx, count, padding, y, TEXT)
         y += count_h + 8
 
-        # As many names as fit in a few lines, and how many are left out
+        # As many names as fit, and how many are left out
         def names_layout(shown: int) -> Pango.Layout:
             text = ", ".join(item.names[:shown])
             if shown < len(item.names):
                 more = self._plural("and_more", len(item.names) - shown)
                 text = f"{text} {more}" if text else more
-            return self._layout(ctx, text, 13.5, 400, width=inner, lines=99)
+            layout = self._layout(ctx, text, 13.5, 400, width=inner, lines=999)
+            layout.set_line_spacing(1.25)
+            return layout
+
+        # The entry takes the session activity at most, less a few lines
+        one_line = self._layout(ctx, "A", 13.5, 400, width=inner, lines=999)
+        one_line.set_line_spacing(1.25)
+        two_lines = self._layout(ctx, "A\nA", 13.5, 400, width=inner, lines=999)
+        two_lines.set_line_spacing(1.25)
+        first_h = self._size(one_line)[1]
+        line_h = self._size(two_lines)[1] - first_h
+        room = self.activity.height - ACTIVITY_HEADER - 1 - ACTIVITY_PADDING
+        room -= y + padding + first_h
+        max_lines = max(1, 1 + int(room / line_h) - PRESENT_MARGIN_LINES)
+        if self.present_lines > 0:
+            max_lines = min(max_lines, self.present_lines)
 
         low, high = 0, len(item.names)
         while low < high:
             middle = (low + high + 1) // 2
-            if names_layout(middle).get_line_count() <= self.present_lines:
+            if names_layout(middle).get_line_count() <= max_lines:
                 low = middle
             else:
                 high = middle - 1
         names = names_layout(low)
-        names.set_line_spacing(1.25)
         _names_w, names_h = self._size(names)
         self._show(ctx, names, padding, y, MUTED)
         height = y + names_h + padding
