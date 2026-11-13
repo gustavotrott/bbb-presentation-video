@@ -69,7 +69,8 @@ class ChatReaction:
 class ActivityItem:
     """One entry of the session activity timeline."""
 
-    # "chat", "poll", "external_video", or one of the one-line entries:
+    # "chat", "poll", "external_video", "present" (who was already in the
+    # meeting when the recording started), or one of the one-line entries:
     # "join", "leave", "raise_hand", "reaction" and "chat_clear"
     kind: str
     timestamp: float
@@ -90,6 +91,8 @@ class ActivityItem:
     reactions: List[ChatReaction] = field(default_factory=list)
     # Chat: a moderator message the meeting is configured to emphasize
     emphasized: bool = False
+    # Present: the names of who was in the meeting, moderators first
+    names: List[str] = field(default_factory=list)
 
     def reactions_at(self, timestamp: float) -> Tuple[Tuple[str, int], ...]:
         """Emoji and count of the reactions at the timestamp, as the client
@@ -523,6 +526,58 @@ def _presence_items(
     return items
 
 
+def _recording_start_items(
+    transitions: List[Tuple[float, str, bool, str, str]],
+    record_intervals: List[Tuple[float, float]],
+    users: Dict[str, User],
+) -> List[ActivityItem]:
+    """Who was in the meeting when the recording started.
+
+    What happens while the meeting is not being recorded is left out of the
+    video, and with it the entries of who joined before the recording started.
+    A single entry at the start of the recording lists them instead. When the
+    recording is paused and resumed, who came or went in the meantime is shown
+    as joining or leaving at the moment it is resumed.
+    """
+    items: List[ActivityItem] = []
+    present: Dict[str, Tuple[str, str]] = {}
+    position = 0
+    previous: Optional[Dict[str, Tuple[str, str]]] = None
+    for start, end in record_intervals:
+        for check in (start, end):
+            while position < len(transitions) and transitions[position][0] < check:
+                _timestamp, person, joined, user_id, name = transitions[position]
+                if joined:
+                    present[person] = (user_id, name)
+                else:
+                    present.pop(person, None)
+                position += 1
+            if check == end:
+                previous = dict(present)
+            elif previous is None:
+                if present:
+                    people = sorted(
+                        present.values(),
+                        key=lambda entry: (
+                            users[entry[0]].role != "MODERATOR",
+                            entry[1].casefold(),
+                        ),
+                    )
+                    items.append(
+                        ActivityItem(
+                            "present", start, names=[name for _id, name in people]
+                        )
+                    )
+            else:
+                for person, (user_id, name) in present.items():
+                    if person not in previous:
+                        items.append(ActivityItem("join", start, user_id, name))
+                for person, (user_id, name) in previous.items():
+                    if person not in present:
+                        items.append(ActivityItem("leave", start, user_id, name))
+    return items
+
+
 def parse_overlay_events(
     directory: str, rejoin_grace: float = REJOIN_GRACE
 ) -> OverlayEvents:
@@ -911,7 +966,10 @@ def parse_overlay_events(
         changes=sorted(changes),
     )
     # What happened while the recording was paused is not part of the video
-    overlay_events.items = [
-        item for item in items if overlay_events.recorded(item.timestamp)
-    ]
+    # ... except for who is in the meeting, which is told when the recording starts
+    started = _recording_start_items(presence, record_intervals, users)
+    overlay_events.items = sorted(
+        started + [item for item in items if overlay_events.recorded(item.timestamp)],
+        key=lambda item: item.timestamp,
+    )
     return overlay_events

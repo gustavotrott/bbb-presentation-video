@@ -74,6 +74,7 @@ TILE_RADIUS = 10
 ENTER_DURATION = 0.35
 COMPACT_KINDS = ("join", "leave", "raise_hand", "reaction", "chat_clear")
 PRESENCE_KINDS = ("join", "leave")
+PRESENT_LINES = 8
 
 STRINGS: Dict[str, Dict[str, Any]] = {
     "en": {
@@ -91,6 +92,8 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "raise_hand": "raised hand",
         "reaction": "reacted",
         "chat_clear": "The public chat was cleared",
+        "present": "IN THE MEETING AS THE RECORDING STARTS",
+        "and_more": ("and {n} more", "and {n} more"),
         "pinned_by": "Pinned by {name}",
         "pinned": "Pinned message",
         "timer": "Timer",
@@ -116,6 +119,8 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "raise_hand": "levantou a mão",
         "reaction": "reagiu",
         "chat_clear": "O chat público foi limpo",
+        "present": "NA SALA NO INÍCIO DA GRAVAÇÃO",
+        "and_more": ("e mais {n}", "e mais {n}"),
         "pinned_by": "Fixada por {name}",
         "pinned": "Mensagem fixada",
         "timer": "Temporizador",
@@ -279,6 +284,8 @@ class OverlayRenderer:
         self.content_area = content[0] if content else None
         self.external_video_notice = bool(config.get("external_video_notice", True))
         self.show_timer = bool(config.get("timer", True))
+        # Lines of names in the entry of who was there when the recording started
+        self.present_lines = max(1, int(config.get("present_lines", PRESENT_LINES)))
         self.webcams = [
             (str(tile.get("user_id") or ""), Rect.from_config(tile, scale))
             for tile in config.get("webcams", [])
@@ -1182,6 +1189,8 @@ class OverlayRenderer:
             height = self._draw_poll(ctx, item, width, clock)
         elif item.kind in PRESENCE_KINDS:
             height = self._draw_presence(ctx, item, width, clock)
+        elif item.kind == "present":
+            height = self._draw_present(ctx, item, width, clock)
         elif item.kind in COMPACT_KINDS:
             height = self._draw_compact(ctx, item, width, clock)
         else:
@@ -1439,6 +1448,15 @@ class OverlayRenderer:
         y = padding
         if icon == "bars":
             x += bars_icon(ctx, x, y + 1, 15, color, (0.5, 1.0, 0.7)) + 9
+        elif icon == "people":
+            # Two heads and shoulders, the one behind fainter
+            for offset, alpha in ((8.0, 0.55), (0.0, 1.0)):
+                ctx.set_source_rgba(*color, alpha)
+                ctx.arc(x + offset + 5.5, y + 5, 3.2, 0, 2 * math.pi)
+                ctx.fill()
+                ctx.arc(x + offset + 5.5, y + 15.5, 5.5, math.pi, 2 * math.pi)
+                ctx.fill()
+            x += 19 + 9
         else:
             rounded_rect(ctx, x + 0.75, y + 2, 17, 13, 3)
             ctx.set_source_rgb(*color)
@@ -1473,6 +1491,46 @@ class OverlayRenderer:
         ctx.set_source_rgb(*self.card)
         ctx.fill()
         ctx.restore()
+
+    def _draw_present(
+        self, ctx: "cairo.Context[Any]", item: ActivityItem, width: float, clock: str
+    ) -> float:
+        """Who was already in the meeting when the recording started."""
+        padding = 16
+        inner = width - 2 * padding
+        y = self._card_header(
+            ctx, width, str(self.strings["present"]), GREEN, clock, "people"
+        )
+
+        count = self._layout(
+            ctx, self._plural("participants", len(item.names)), 17.5, 700, width=inner
+        )
+        _count_w, count_h = self._size(count)
+        self._show(ctx, count, padding, y, TEXT)
+        y += count_h + 8
+
+        # As many names as fit in a few lines, and how many are left out
+        def names_layout(shown: int) -> Pango.Layout:
+            text = ", ".join(item.names[:shown])
+            if shown < len(item.names):
+                more = self._plural("and_more", len(item.names) - shown)
+                text = f"{text} {more}" if text else more
+            return self._layout(ctx, text, 13.5, 400, width=inner, lines=99)
+
+        low, high = 0, len(item.names)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if names_layout(middle).get_line_count() <= self.present_lines:
+                low = middle
+            else:
+                high = middle - 1
+        names = names_layout(low)
+        names.set_line_spacing(1.25)
+        _names_w, names_h = self._size(names)
+        self._show(ctx, names, padding, y, MUTED)
+        height = y + names_h + padding
+        self._card_background(ctx, width, height)
+        return height
 
     def _draw_poll(
         self, ctx: "cairo.Context[Any]", item: ActivityItem, width: float, clock: str

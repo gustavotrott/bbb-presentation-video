@@ -6,7 +6,8 @@
 
 The overlay is the frame drawn around the presentation and the webcams: the
 meeting name, date and elapsed time, who is speaking, the name of each webcam
-and a timeline with the chat messages, published polls and external videos.
+and a timeline with the chat messages, published polls and external videos,
+starting with who was in the meeting when the recording started.
 It also shows the timer of the meeting and, while a video from a link is being
 played, its address in the place of the presentation.
 
