@@ -22,4 +22,5 @@ Depends: ${misc:Depends}, ${python3:Depends},
  gir1.2-pango-1.0,
  ffmpeg (>= 7:2.5.0),
  fonts-croscore
+Recommends: python3-segno
 Description: Render BigBlueButton recording events.xml to a video
