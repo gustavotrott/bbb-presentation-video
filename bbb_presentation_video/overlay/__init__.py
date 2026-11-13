@@ -7,6 +7,8 @@
 The overlay is the frame drawn around the presentation and the webcams: the
 meeting name, date and elapsed time, who is speaking, the name of each webcam
 and a timeline with the chat messages, published polls and external videos.
+It also shows the timer of the meeting and, while a video from a link is being
+played, its address in the place of the presentation.
 
 The output is raw video with an alpha channel (BGRA, premultiplied), meant to
 be composited over the media by the recording scripts.
@@ -77,7 +79,14 @@ def main() -> None:
 
     # Each kind of timeline entry can be turned off: {"events": {"join": false}}
     shown = config.get("events") or {}
-    events.items = [item for item in events.items if shown.get(item.kind, True)]
+    # The notice of the chat being cleared and the pinned message go with the chat
+    events.items = [
+        item
+        for item in events.items
+        if shown.get("chat" if item.kind == "chat_clear" else item.kind, True)
+    ]
+    if not shown.get("chat", True):
+        events.pinned = []
 
     renderer = OverlayRenderer(events, args.width, args.height, config)
 

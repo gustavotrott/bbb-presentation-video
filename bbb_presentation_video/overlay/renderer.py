@@ -19,6 +19,7 @@ import tempfile
 import time
 import urllib.request
 import zlib
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,7 +32,14 @@ gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import GdkPixbuf, Pango, PangoCairo
 
-from bbb_presentation_video.overlay.events import ActivityItem, OverlayEvents
+from bbb_presentation_video.overlay.events import (
+    ActivityItem,
+    ExternalVideo,
+    OverlayEvents,
+    PinnedMessage,
+    first_line_markup,
+    is_jumbomoji,
+)
 
 try:
     import segno
@@ -64,7 +72,7 @@ AREA_RADIUS = 12
 TILE_RADIUS = 10
 # How long a new timeline entry takes to slide in, in seconds
 ENTER_DURATION = 0.35
-COMPACT_KINDS = ("join", "leave", "raise_hand", "reaction")
+COMPACT_KINDS = ("join", "leave", "raise_hand", "reaction", "chat_clear")
 PRESENCE_KINDS = ("join", "leave")
 
 STRINGS: Dict[str, Dict[str, Any]] = {
@@ -82,7 +90,14 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "leave": "left",
         "raise_hand": "raised hand",
         "reaction": "reacted",
-        "reaction_chat": "reacted to a message",
+        "chat_clear": "The public chat was cleared",
+        "pinned_by": "Pinned by {name}",
+        "pinned": "Pinned message",
+        "timer": "Timer",
+        "stopwatch": "Stopwatch",
+        "external_video_playing": "A video from a link is being shown",
+        "external_video_hint": "The video is not part of the recording. "
+        "Open the link to watch it.",
         "months": "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(),
         "date": "{month} {day}, {year}",
     },
@@ -100,7 +115,14 @@ STRINGS: Dict[str, Dict[str, Any]] = {
         "leave": "saiu",
         "raise_hand": "levantou a mão",
         "reaction": "reagiu",
-        "reaction_chat": "reagiu a uma mensagem",
+        "chat_clear": "O chat público foi limpo",
+        "pinned_by": "Fixada por {name}",
+        "pinned": "Mensagem fixada",
+        "timer": "Temporizador",
+        "stopwatch": "Cronômetro",
+        "external_video_playing": "Um vídeo de link está sendo exibido",
+        "external_video_hint": "O vídeo não faz parte da gravação. "
+        "Abra o link para assistir.",
         "months": [],
         "date": "{day:02d}/{month_number:02d}/{year}",
     },
@@ -248,6 +270,15 @@ class OverlayRenderer:
             for area in config.get("areas", [])
             if area.get("name") != "webcam"
         ]
+        # Where the presentation is: an external video is played in its place
+        content = [
+            Rect.from_config(area, scale)
+            for area in config.get("areas", [])
+            if area.get("name") == "presentation"
+        ]
+        self.content_area = content[0] if content else None
+        self.external_video_notice = bool(config.get("external_video_notice", True))
+        self.show_timer = bool(config.get("timer", True))
         self.webcams = [
             (str(tile.get("user_id") or ""), Rect.from_config(tile, scale))
             for tile in config.get("webcams", [])
@@ -274,7 +305,8 @@ class OverlayRenderer:
 
         self.date = self._format_date(config.get("timezone"))
         self._state: Any = None
-        self._item_cache: Dict[int, cairo.ImageSurface] = {}
+        self._item_cache: Dict[int, Tuple[Any, cairo.ImageSurface]] = {}
+        self._pinned_cache: Optional[Tuple[int, cairo.ImageSurface]] = None
 
     @staticmethod
     def _load_image(filename: str, size: int = 0) -> cairo.ImageSurface:
@@ -465,13 +497,36 @@ class OverlayRenderer:
             age = timestamp - item.timestamp
             if age < ENTER_DURATION:
                 entering.append(round(age, 3))
+        timer = self._timer_text(timestamp)
+        video = (
+            events.external_video_at(timestamp)
+            if self.external_video_notice and self.content_area is not None
+            else None
+        )
         return (
             int(events.recording_time(timestamp)),
             talking,
             events.participants_at(timestamp),
             visible,
             tuple(entering),
+            # Reactions, pinned message, chat cleared
+            bisect_right(events.changes, timestamp),
+            timer,
+            video.start if video is not None else None,
         )
+
+    def _timer_text(self, timestamp: float) -> Optional[Tuple[bool, bool, bool, str]]:
+        """What the timer shows: stopwatch, running, over, and the time."""
+        state = self.events.timer_at(timestamp) if self.show_timer else None
+        if state is None:
+            return None
+        seconds, over = state.value(timestamp)
+        # A countdown shows the second it is in; a stopwatch the ones gone by
+        total = int(seconds) if state.stopwatch else math.ceil(seconds - 1e-6)
+        text = f"{total // 60:02d}:{total % 60:02d}"
+        if total >= 3600:
+            text = f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+        return (state.stopwatch, state.running and not over, over, text)
 
     def render(self, timestamp: float) -> bool:
         """Draw the frame for a meeting timestamp.
@@ -482,7 +537,9 @@ class OverlayRenderer:
         if state == self._state:
             return False
         self._state = state
-        clock, talking, participants, visible, _entering = state
+        clock, talking, participants, visible, _entering, _changes, timer, _video = (
+            state
+        )
 
         ctx = self.ctx
         ctx.save()
@@ -508,9 +565,12 @@ class OverlayRenderer:
         ctx.restore()
 
         self._draw_top_bar(clock, talking)
-        self._draw_speakers(talking)
+        self._draw_speakers(talking, self._draw_timer(timer))
         self._draw_activity(timestamp, participants, visible)
         self._draw_webcam_labels(set(talking))
+        video = self.events.external_video_at(timestamp)
+        if video is not None and _video is not None:
+            self._draw_external_video_notice(video)
 
         self.surface.flush()
         return True
@@ -534,6 +594,12 @@ class OverlayRenderer:
         middle = bar.y + bar.height / 2
         left = bar.x + 24
         right = bar.x + bar.width - 24
+
+        # The timer, when it has no other place, takes the right end of the bar
+        if (self.speakers is None or self.speakers.height >= 100) and bar.width >= 900:
+            timer = self._state[6] if self._state is not None else None
+            if timer is not None:
+                right -= 14 + 20 + 8 + 10 + 16 + 170
 
         # Who is speaking goes on the right of the bar, unless it has its own place
         if self.speakers is None and bar.width >= 900:
@@ -714,11 +780,74 @@ class OverlayRenderer:
             )
         return total
 
-    def _draw_speakers(self, talking: Tuple[str, ...]) -> None:
+    def _draw_timer(self, timer: Optional[Tuple[bool, bool, bool, str]]) -> float:
+        """The timer or stopwatch of the meeting, while it is on the screen.
+
+        It goes on the right end of the place of who is speaking (or of the top
+        bar). Returns the width taken there.
+        """
+        if timer is None:
+            return 0.0
+        stopwatch, running, over, text = timer
+        place = self.speakers
+        if place is None or place.height >= 100:
+            place = self.top_bar if self.top_bar.width >= 900 else None
+        if place is None or place.width <= 0:
+            return 0.0
+        ctx = self.ctx
+        height = 42.0
+        label = self._layout(
+            ctx, str(self.strings["stopwatch" if stopwatch else "timer"]), 13.5, 600
+        )
+        label_w, label_h = self._size(label)
+        value = self._layout(ctx, text, 19, 700)
+        value_w, value_h = self._size(value)
+        # Digits change width; keep the pill steady
+        value_w = math.ceil(value_w / 8) * 8
+        width = 14 + 20 + 8 + label_w + 10 + value_w + 16
+        x = place.x + place.width - width
+        if place is self.top_bar:
+            x -= 24
+        y = place.y + place.height / 2 - height / 2
+        color = RED if over else (TEXT if running else MUTED)
+
+        rounded_rect(ctx, x, y, width, height, height / 2)
+        ctx.set_source_rgba(*SHADE, 0.60)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(
+            *(RED if over else AMBER), 0.85 if running or over else 0.35
+        )
+        ctx.set_line_width(1.5)
+        ctx.stroke()
+
+        # A small clock: the stopwatch has the button on top
+        center_x = x + 14 + 10
+        center_y = y + height / 2 + (1.5 if stopwatch else 0)
+        ctx.set_source_rgb(*(RED if over else AMBER))
+        ctx.set_line_width(1.8)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.arc(center_x, center_y, 8, 0, 2 * math.pi)
+        ctx.stroke()
+        ctx.move_to(center_x, center_y)
+        ctx.line_to(center_x, center_y - 4.5)
+        ctx.move_to(center_x, center_y)
+        ctx.line_to(center_x + 3.2, center_y + 1.8)
+        if stopwatch:
+            ctx.move_to(center_x - 2.5, center_y - 11)
+            ctx.line_to(center_x + 2.5, center_y - 11)
+        ctx.stroke()
+
+        text_x = x + 14 + 20 + 8
+        middle = y + height / 2
+        self._show(ctx, label, text_x, middle - label_h / 2, MUTED)
+        self._show(ctx, value, text_x + label_w + 10, middle - value_h / 2, color)
+        return width + 16
+
+    def _draw_speakers(self, talking: Tuple[str, ...], taken: float = 0.0) -> None:
         """Who is speaking, in the place given by the layout.
 
         A short and wide place gets a line of chips; a taller one gets a panel
-        with one person per line.
+        with one person per line. The timer takes part of the line when shown.
         """
         area = self.speakers
         if area is None or area.width <= 0 or area.height <= 0:
@@ -726,7 +855,7 @@ class OverlayRenderer:
         ctx = self.ctx
         if area.height < 100:
             self._draw_speaker_row(
-                talking, area.x, area.y + area.height / 2 - 21, area.width
+                talking, area.x, area.y + area.height / 2 - 21, area.width - taken
             )
             return
 
@@ -860,6 +989,18 @@ class OverlayRenderer:
         item_x = panel.x + padding
         item_width = panel.width - 2 * padding
 
+        # A pinned message stays at the top, as in the chat of the meeting
+        pinned = self.events.pinned_at(timestamp)
+        if pinned is not None and pinned.item.kind == "chat":
+            pinned_surface = self._pinned_surface(pinned, item_width)
+            ctx.save()
+            ctx.translate(item_x, list_top + 12)
+            ctx.scale(1 / self.scale, 1 / self.scale)
+            ctx.set_source_surface(pinned_surface, 0, 0)
+            ctx.paint()
+            ctx.restore()
+            list_top += 12 + pinned_surface.get_height() / self.scale + 6
+
         ctx.save()
         ctx.rectangle(panel.x, list_top, panel.width, list_bottom - list_top)
         ctx.clip()
@@ -868,7 +1009,9 @@ class OverlayRenderer:
         used: List[int] = []
         for index in range(visible - 1, -1, -1):
             item = self.events.items[index]
-            item_surface = self._item_surface(index, item, item_width)
+            if item.end is not None and item.end <= timestamp:
+                continue
+            item_surface = self._item_surface(index, item, item_width, timestamp)
             height = item_surface.get_height() / self.scale
             age = timestamp - item.timestamp
             progress = min(1.0, max(0.0, age / ENTER_DURATION))
@@ -907,12 +1050,122 @@ class OverlayRenderer:
             if index not in used:
                 del self._item_cache[index]
 
-    def _item_surface(
-        self, index: int, item: ActivityItem, width: float
+    def _pinned_surface(
+        self, pinned: PinnedMessage, width: float
     ) -> cairo.ImageSurface:
+        key = id(pinned)
+        if self._pinned_cache is not None and self._pinned_cache[0] == key:
+            return self._pinned_cache[1]
+        scratch = cairo.ImageSurface(
+            cairo.FORMAT_ARGB32,
+            math.ceil(width * self.scale),
+            math.ceil(400 * self.scale),
+        )
+        ctx = cairo.Context(scratch)
+        ctx.scale(self.scale, self.scale)
+        height = self._draw_pinned(ctx, pinned, width)
+        scratch.flush()
+        surface = cairo.ImageSurface(
+            cairo.FORMAT_ARGB32,
+            scratch.get_width(),
+            max(1, math.ceil(min(height, 400) * self.scale)),
+        )
+        crop = cairo.Context(surface)
+        crop.set_source_surface(scratch, 0, 0)
+        crop.paint()
+        surface.flush()
+        self._pinned_cache = (key, surface)
+        return surface
+
+    def _draw_pinned(
+        self, ctx: "cairo.Context[Any]", pinned: PinnedMessage, width: float
+    ) -> float:
+        padding = 14.0
+        inner = width - 2 * padding
+        item = pinned.item
+
+        # Pin: a head, and a needle pointing down to the left
+        ctx.save()
+        ctx.translate(padding + 8, padding + 9)
+        ctx.rotate(math.pi / 4)
+        ctx.set_source_rgb(*AMBER)
+        rounded_rect(ctx, -4.5, -8, 9, 8, 2)
+        ctx.fill()
+        ctx.rectangle(-6, 0, 12, 2)
+        ctx.fill()
+        ctx.set_line_width(1.6)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.move_to(0, 2)
+        ctx.line_to(0, 8.5)
+        ctx.stroke()
+        ctx.restore()
+
+        label = (
+            str(self.strings["pinned_by"]).format(name=pinned.pinned_by)
+            if pinned.pinned_by
+            else str(self.strings["pinned"])
+        )
+        header = self._layout(ctx, label, 12.5, 700, width=inner - 26)
+        _header_w, header_h = self._size(header)
+        self._show(ctx, header, padding + 26, padding, AMBER)
+        y = padding + header_h + 8
+
+        name = self._layout(ctx, item.name, 14, 700, width=inner)
+        _name_w, name_h = self._size(name)
+        self._show(ctx, name, padding, y, TEXT)
+        y += name_h + 2
+
+        message = self._message_layout(ctx, item, inner, 15.5, lines=3)
+        _message_w, message_h = self._size(message)
+        self._show(ctx, message, padding, y, TEXT_SOFT)
+        height = y + message_h + padding
+
+        ctx.save()
+        ctx.set_operator(cairo.OPERATOR_DEST_OVER)
+        rounded_rect(ctx, 0, 0, width, height, 10)
+        ctx.set_source_rgb(*self.card)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(*AMBER, 0.10)
+        ctx.fill()
+        ctx.restore()
+        rounded_rect(ctx, 0.75, 0.75, width - 1.5, height - 1.5, 10)
+        ctx.set_source_rgba(*AMBER, 0.45)
+        ctx.set_line_width(1.5)
+        ctx.stroke()
+        return height
+
+    def _message_layout(
+        self,
+        ctx: "cairo.Context[Any]",
+        item: ActivityItem,
+        width: float,
+        size: float,
+        lines: int,
+        first_line: bool = False,
+    ) -> Pango.Layout:
+        """The text of a chat message with its Markdown formatting."""
+        weight = 700 if item.emphasized and not first_line else 400
+        text = item.text.split("\n", 1)[0] if first_line else item.text
+        layout = self._layout(ctx, text, size, weight, width=width, lines=lines)
+        markup = first_line_markup(item.markup) if first_line else item.markup
+        if markup:
+            try:
+                _ok, attributes, parsed, _accel = Pango.parse_markup(markup, -1, "\0")
+                layout.set_text(parsed, -1)
+                layout.set_attributes(attributes)
+            except Exception as error:
+                print(f"Could not format a chat message: {error}")
+        layout.set_spacing(int(2 * Pango.SCALE))
+        return layout
+
+    def _item_surface(
+        self, index: int, item: ActivityItem, width: float, timestamp: float = 0.0
+    ) -> cairo.ImageSurface:
+        # The reactions to a message change after it is on the screen
+        version = item.reactions_at(timestamp) if item.reactions else ()
         cached = self._item_cache.get(index)
-        if cached is not None:
-            return cached
+        if cached is not None and cached[0] == version:
+            return cached[1]
 
         # Draw once on a scratch surface to measure, then crop to the height used
         scratch = cairo.ImageSurface(
@@ -924,7 +1177,7 @@ class OverlayRenderer:
         ctx.scale(self.scale, self.scale)
         clock = format_clock(self.events.recording_time(item.timestamp))
         if item.kind == "chat":
-            height = self._draw_chat(ctx, item, width, clock)
+            height = self._draw_chat(ctx, item, width, clock, version)
         elif item.kind == "poll":
             height = self._draw_poll(ctx, item, width, clock)
         elif item.kind in PRESENCE_KINDS:
@@ -944,11 +1197,16 @@ class OverlayRenderer:
         crop.set_source_surface(scratch, 0, 0)
         crop.paint()
         surface.flush()
-        self._item_cache[index] = surface
+        self._item_cache[index] = (version, surface)
         return surface
 
     def _draw_chat(
-        self, ctx: "cairo.Context[Any]", item: ActivityItem, width: float, clock: str
+        self,
+        ctx: "cairo.Context[Any]",
+        item: ActivityItem,
+        width: float,
+        clock: str,
+        reactions: Tuple[Tuple[str, int], ...] = (),
     ) -> float:
         avatar = 36
         text_x = avatar + 14
@@ -989,26 +1247,78 @@ class OverlayRenderer:
         self._show(ctx, name, text_x, 0, TEXT)
         self._show(ctx, when, text_x + name_w + 10, 2.5, MUTED)
 
+        y = name_h + 3
+
+        # The message being answered: who wrote it and its first line
+        quoted = item.reply_to
+        if quoted is not None and (quoted.end is None or quoted.end > item.timestamp):
+            quote_w = width - text_x
+            quote_name = self._layout(ctx, quoted.name, 12.5, 700, width=quote_w - 24)
+            _quote_name_w, quote_name_h = self._size(quote_name)
+            quote_text = self._message_layout(
+                ctx, quoted, quote_w - 24, 14, lines=1, first_line=True
+            )
+            _quote_text_w, quote_text_h = self._size(quote_text)
+            quote_h = 7 + quote_name_h + 1 + quote_text_h + 7
+            rounded_rect(ctx, text_x, y + 2, quote_w, quote_h, 6)
+            ctx.set_source_rgba(1, 1, 1, 0.06)
+            ctx.fill()
+            rounded_rect(ctx, text_x, y + 2, 3, quote_h, 1.5)
+            ctx.set_source_rgb(*BLUE)
+            ctx.fill()
+            self._show(ctx, quote_name, text_x + 13, y + 2 + 7, BLUE)
+            self._show(
+                ctx, quote_text, text_x + 13, y + 2 + 7 + quote_name_h + 1, MUTED
+            )
+            y += 2 + quote_h + 5
+
         qr_size = 92.0 if self._has_qr_code(item.url) else 0.0
         message_width = width - text_x - (qr_size + 12 if qr_size else 0)
-        message = self._layout(ctx, item.text, 16.5, 400, width=message_width, lines=8)
-        if item.markup:
-            # Markdown of the message: bold, italic, code, lists, quotes, links
-            try:
-                _ok, attributes, text, _accel = Pango.parse_markup(
-                    item.markup, -1, "\0"
-                )
-                message.set_text(text, -1)
-                message.set_attributes(attributes)
-            except Exception as error:
-                print(f"Could not format a chat message: {error}")
-        message.set_spacing(int(2 * Pango.SCALE))
+        # A message of one to three emoji alone shows them larger
+        jumbo = is_jumbomoji(item.text)
+        message = self._message_layout(
+            ctx, item, message_width, 38 if jumbo else 16.5, lines=8
+        )
         _message_w, message_h = self._size(message)
-        self._show(ctx, message, text_x, name_h + 3, TEXT_SOFT)
+        self._show(ctx, message, text_x, y, TEXT_SOFT)
         if qr_size:
-            self._draw_qr_code(ctx, item.url, width - qr_size, name_h + 6, qr_size)
+            self._draw_qr_code(ctx, item.url, width - qr_size, y + 3, qr_size)
             message_h = max(message_h, qr_size + 5)
-        return max(avatar + 4, name_h + 3 + message_h)
+        y += message_h
+
+        # Reactions to the message: one chip per emoji, with how many
+        if reactions:
+            y += 6
+            chip_x = text_x
+            chip_h = 26.0
+            for emoji, count in reactions:
+                emoji_layout = self._layout(ctx, emoji, 15)
+                emoji_w, emoji_h = self._size(emoji_layout)
+                count_layout = self._layout(ctx, str(count), 13, 600)
+                count_w, count_h = self._size(count_layout)
+                chip_w = 9 + emoji_w + 5 + count_w + 10
+                if chip_x + chip_w > width and chip_x > text_x:
+                    chip_x = text_x
+                    y += chip_h + 5
+                rounded_rect(ctx, chip_x, y, chip_w, chip_h, chip_h / 2)
+                ctx.set_source_rgba(*BLUE, 0.16)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(*BLUE, 0.55)
+                ctx.set_line_width(1)
+                ctx.stroke()
+                self._show(
+                    ctx, emoji_layout, chip_x + 9, y + (chip_h - emoji_h) / 2, TEXT
+                )
+                self._show(
+                    ctx,
+                    count_layout,
+                    chip_x + 9 + emoji_w + 5,
+                    y + (chip_h - count_h) / 2,
+                    TEXT_SOFT,
+                )
+                chip_x += chip_w + 6
+            y += chip_h + 2
+        return max(avatar + 4, y)
 
     def _has_qr_code(self, url: str) -> bool:
         return bool(url) and self.link_qr_code and segno is not None
@@ -1094,7 +1404,8 @@ class OverlayRenderer:
         text_x = icon + (10 if reaction else 14)
         middle = height / 2
 
-        emoji = self._layout(ctx, item.emoji or "\u270b", 40 if reaction else 19)
+        default = "\U0001f9f9" if item.kind == "chat_clear" else "\u270b"
+        emoji = self._layout(ctx, item.emoji or default, 40 if reaction else 19)
         emoji_w, emoji_h = self._size(emoji)
         self._show(ctx, emoji, (icon - emoji_w) / 2, middle - emoji_h / 2, TEXT)
 
@@ -1103,8 +1414,7 @@ class OverlayRenderer:
         self._show(ctx, when, width - when_w, middle - when_h / 2, MUTED)
 
         # A long name is shortened; what the user did is always readable
-        key = "reaction_chat" if item.kind == "reaction" and item.text else item.kind
-        action = self._layout(ctx, str(self.strings[key]), 14.5, 400)
+        action = self._layout(ctx, str(self.strings[item.kind]), 14.5, 400)
         action_w, action_h = self._size(action)
         name_width = width - text_x - when_w - 12 - action_w - 6
         name = self._layout(ctx, item.name, 14.5, 600, width=name_width)
@@ -1253,6 +1563,70 @@ class OverlayRenderer:
         height = max(y, top + qr_size) + padding
         self._card_background(ctx, width, height)
         return height
+
+    def _draw_external_video_notice(self, video: ExternalVideo) -> None:
+        """Over the presentation, which the meeting did not see meanwhile: the
+        address of the video being played, since it is not in the recording."""
+        area = self.content_area
+        if area is None or area.width < 320 or area.height < 200:
+            return
+        ctx = self.ctx
+        rounded_rect(ctx, area.x, area.y, area.width, area.height, AREA_RADIUS)
+        ctx.set_source_rgb(*SHADE)
+        ctx.fill()
+
+        qr_size = (
+            min(300.0, area.height * 0.42) if self._has_qr_code(video.url) else 0.0
+        )
+        text_w = min(area.width - 96, 900.0)
+        title = self._layout(
+            ctx, str(self.strings["external_video_playing"]), 30, 700, width=text_w
+        )
+        title.set_alignment(Pango.Alignment.CENTER)
+        _title_w, title_h = self._size(title)
+        url = self._layout(ctx, video.url, 22, 500, width=text_w, lines=3)
+        url.set_alignment(Pango.Alignment.CENTER)
+        attributes = Pango.AttrList()
+        attributes.insert(Pango.attr_underline_new(Pango.Underline.SINGLE))
+        url.set_attributes(attributes)
+        _url_w, url_h = self._size(url)
+        lines = [str(self.strings["external_video_hint"])]
+        if video.shared_by:
+            lines.insert(0, str(self.strings["shared_by"]).format(name=video.shared_by))
+        hint = self._layout(ctx, "\n".join(lines), 17, 400, width=text_w, lines=4)
+        hint.set_alignment(Pango.Alignment.CENTER)
+        _hint_w, hint_h = self._size(hint)
+
+        icon = 64.0
+        total = icon + 22 + title_h + 18 + url_h + 14 + hint_h
+        if qr_size:
+            total += 30 + qr_size
+        center = area.x + area.width / 2
+        y = area.y + max(16.0, (area.height - total) / 2)
+
+        # Play button
+        ctx.arc(center, y + icon / 2, icon / 2, 0, 2 * math.pi)
+        ctx.set_source_rgba(*AMBER, 0.16)
+        ctx.fill_preserve()
+        ctx.set_source_rgb(*AMBER)
+        ctx.set_line_width(2)
+        ctx.stroke()
+        ctx.move_to(center - 8, y + icon / 2 - 13)
+        ctx.line_to(center + 14, y + icon / 2)
+        ctx.line_to(center - 8, y + icon / 2 + 13)
+        ctx.close_path()
+        ctx.fill()
+        y += icon + 22
+
+        left = center - text_w / 2
+        self._show(ctx, title, left, y, TEXT)
+        y += title_h + 18
+        self._show(ctx, url, left, y, (0.541, 0.722, 1.0))
+        y += url_h + 14
+        self._show(ctx, hint, left, y, MUTED)
+        y += hint_h + 30
+        if qr_size:
+            self._draw_qr_code(ctx, video.url, center - qr_size / 2, y, qr_size)
 
 
 def render_stream(

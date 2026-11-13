@@ -56,11 +56,21 @@ class PollAnswer:
 
 
 @dataclass
+class ChatReaction:
+    """A reaction to a chat message, from when it was sent until it was removed."""
+
+    start: float
+    emoji: str
+    user_id: str
+    end: Optional[float] = None
+
+
+@dataclass
 class ActivityItem:
     """One entry of the session activity timeline."""
 
     # "chat", "poll", "external_video", or one of the one-line entries:
-    # "join", "leave", "raise_hand" and "reaction"
+    # "join", "leave", "raise_hand", "reaction" and "chat_clear"
     kind: str
     timestamp: float
     user_id: Optional[str] = None
@@ -72,6 +82,71 @@ class ActivityItem:
     markup: str = ""
     answers: List[PollAnswer] = field(default_factory=list)
     responders: int = 0
+    # When the entry goes away (the public chat was cleared)
+    end: Optional[float] = None
+    # Chat: the message this one answers, shown as a quote above it
+    reply_to: Optional["ActivityItem"] = None
+    # Chat: reactions to the message, which come and go during the meeting
+    reactions: List[ChatReaction] = field(default_factory=list)
+    # Chat: a moderator message the meeting is configured to emphasize
+    emphasized: bool = False
+
+    def reactions_at(self, timestamp: float) -> Tuple[Tuple[str, int], ...]:
+        """Emoji and count of the reactions at the timestamp, as the client
+        orders them: the most used first, then the one used first."""
+        counts: Dict[str, List[float]] = {}
+        for reaction in self.reactions:
+            if reaction.start <= timestamp and (
+                reaction.end is None or timestamp < reaction.end
+            ):
+                entry = counts.setdefault(reaction.emoji, [0, reaction.start])
+                entry[0] += 1
+                entry[1] = min(entry[1], reaction.start)
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1][0], kv[1][1]))
+        return tuple((emoji, int(entry[0])) for emoji, entry in ordered)
+
+
+@dataclass
+class PinnedMessage:
+    """A chat message kept at the top of the chat by a moderator."""
+
+    start: float
+    end: float
+    item: ActivityItem
+    pinned_by: str = ""
+
+
+@dataclass
+class ExternalVideo:
+    """A video from a link, played in the place of the presentation."""
+
+    start: float
+    end: float
+    url: str
+    shared_by: str = ""
+
+
+@dataclass
+class TimerState:
+    """The timer (or stopwatch) of the meeting from a timestamp on."""
+
+    timestamp: float
+    active: bool = False
+    stopwatch: bool = True
+    running: bool = False
+    # Length of the countdown and time already counted, in seconds
+    time: float = 0.0
+    accumulated: float = 0.0
+
+    def value(self, timestamp: float) -> Tuple[float, bool]:
+        """Seconds shown at the timestamp, and whether a countdown is over."""
+        counted = self.accumulated
+        if self.running:
+            counted += max(0.0, timestamp - self.timestamp)
+        if self.stopwatch:
+            return counted, False
+        remaining = self.time - counted
+        return max(0.0, remaining), self.running and remaining <= 0
 
 
 @dataclass
@@ -87,6 +162,12 @@ class OverlayEvents:
     # (timestamp, number of users in the meeting from that point on)
     participants: List[Tuple[float, int]]
     items: List[ActivityItem]
+    pinned: List[PinnedMessage] = field(default_factory=list)
+    external_videos: List[ExternalVideo] = field(default_factory=list)
+    timer: List[TimerState] = field(default_factory=list)
+    # Moments in which something already on screen changes (a reaction, a
+    # pinned message, the chat being cleared), sorted
+    changes: List[float] = field(default_factory=list)
 
     def recording_time(self, timestamp: float) -> float:
         """Convert a meeting timestamp to a position in the recording."""
@@ -111,6 +192,27 @@ class OverlayEvents:
         i = bisect_right(self.participants, (timestamp, 1 << 30))
         return self.participants[i - 1][1] if i > 0 else 0
 
+    def pinned_at(self, timestamp: float) -> Optional[PinnedMessage]:
+        for pinned in self.pinned:
+            if pinned.start <= timestamp < pinned.end:
+                return pinned
+        return None
+
+    def external_video_at(self, timestamp: float) -> Optional[ExternalVideo]:
+        for video in self.external_videos:
+            if video.start <= timestamp < video.end:
+                return video
+        return None
+
+    def timer_at(self, timestamp: float) -> Optional[TimerState]:
+        """The timer shown at the timestamp, if it is on the screen."""
+        state: Optional[TimerState] = None
+        for candidate in self.timer:
+            if candidate.timestamp > timestamp:
+                break
+            state = candidate
+        return state if state is not None and state.active else None
+
     def talking_at(self, timestamp: float) -> List[str]:
         """Users talking at the timestamp, the one talking for longest first."""
         active = [
@@ -128,6 +230,13 @@ def _text(event: etree._Element, *names: str) -> Optional[str]:
         if element is not None and element.text is not None:
             return element.text
     return None
+
+
+def _milliseconds(value: Optional[str]) -> float:
+    try:
+        return int(value or "0") / 1000
+    except ValueError:
+        return 0.0
 
 
 _BLOCK_END = re.compile(r"</(p|div|li|h[1-6]|blockquote|pre)\s*>|<br\s*/?>", re.I)
@@ -284,6 +393,63 @@ def chat_markup(message: str) -> str:
         return ""
 
 
+def first_line_markup(markup: str) -> str:
+    """The first line of a message, which is what a quote of it shows."""
+    return markup.split("\n", 1)[0]
+
+
+def _is_emoji_char(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x1F000 <= code <= 0x1FAFF
+        or 0x2600 <= code <= 0x27BF
+        or 0x2B00 <= code <= 0x2BFF
+        or 0x2190 <= code <= 0x21FF
+        or 0x2300 <= code <= 0x23FF
+        or code in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D)
+    )
+
+
+# Up to this many emoji alone in a message are shown larger, as in the client
+MAX_JUMBOMOJI_COUNT = 3
+
+
+def is_jumbomoji(text: str) -> bool:
+    """Whether the message is nothing but one to three emoji."""
+    condensed = re.sub(r"\s+", "", text)
+    if not condensed:
+        return False
+    count = 0
+    joined = False
+    index = 0
+    while index < len(condensed):
+        char = condensed[index]
+        code = ord(char)
+        if code == 0x200D:  # Zero width joiner: the next emoji is the same one
+            joined = True
+        elif code == 0xFE0F or 0x1F3FB <= code <= 0x1F3FF or code == 0x20E3:
+            pass  # Variation selector, skin tone, keycap
+        elif 0x1F1E6 <= code <= 0x1F1FF:
+            # A flag is a pair of regional indicators
+            if index + 1 >= len(condensed) or not (
+                0x1F1E6 <= ord(condensed[index + 1]) <= 0x1F1FF
+            ):
+                return False
+            index += 1
+            count += 1
+        elif _is_emoji_char(char) or (
+            char in "0123456789#*"
+            and condensed[index + 1 : index + 3].endswith("\u20e3")
+        ):
+            if not joined:
+                count += 1
+            joined = False
+        else:
+            return False
+        index += 1
+    return 1 <= count <= MAX_JUMBOMOJI_COUNT
+
+
 _HREF = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 
@@ -392,7 +558,38 @@ def parse_overlay_events(
     talk_raw: List[TalkInterval] = []
     items: List[ActivityItem] = []
     chat_by_id: Dict[str, ActivityItem] = {}
+    deleted: "set[int]" = set()
+    pinned: List[PinnedMessage] = []
+    external_videos: List[ExternalVideo] = []
+    timer: List[TimerState] = []
+    changes: List[float] = []
     presenter: Optional[str] = None
+
+    def unpin(timestamp: float) -> None:
+        if pinned and pinned[-1].end > timestamp:
+            pinned[-1].end = timestamp
+            changes.append(timestamp)
+
+    def stop_external_video(timestamp: float) -> None:
+        if external_videos and external_videos[-1].end > timestamp:
+            external_videos[-1].end = timestamp
+
+    def timer_change(timestamp: float, **fields: Any) -> None:
+        """A new state of the timer, with what was counted so far settled."""
+        last = timer[-1] if timer else TimerState(timestamp)
+        counted = last.accumulated
+        if last.running:
+            counted += max(0.0, timestamp - last.timestamp)
+            # A countdown stops by itself at zero, and starts over
+            if not last.stopwatch and counted >= last.time:
+                last = TimerState(last.timestamp, last.active, False, False, last.time)
+                counted = 0.0
+        state = TimerState(
+            timestamp, last.active, last.stopwatch, last.running, last.time, counted
+        )
+        for key, value in fields.items():
+            setattr(state, key, value)
+        timer.append(state)
 
     def stop_talking(user_id: str, timestamp: float) -> None:
         start = talk_start.pop(user_id, None)
@@ -473,17 +670,32 @@ def parse_overlay_events(
         elif name == "SendPublicChatMessageReactionRecordEvent":
             user_id = _text(event, "senderId")
             emoji = (_text(event, "reactionEmoji") or "").strip()
-            if user_id is not None and user_id in users and emoji:
-                items.append(
-                    ActivityItem(
-                        "reaction",
-                        timestamp,
-                        user_id,
-                        users[user_id].name,
-                        emoji=emoji,
-                        text="chat",
-                    )
-                )
+            item_opt = chat_by_id.get(_text(event, "messageId") or "")
+            if user_id is not None and item_opt is not None and emoji:
+                # As in the client, each user reacts once with each emoji
+                if not any(
+                    reaction.end is None
+                    and reaction.user_id == user_id
+                    and reaction.emoji == emoji
+                    for reaction in item_opt.reactions
+                ):
+                    item_opt.reactions.append(ChatReaction(timestamp, emoji, user_id))
+                    changes.append(timestamp)
+
+        elif name == "DeletePublicChatMessageReactionRecordEvent":
+            user_id = _text(event, "senderId")
+            emoji = (_text(event, "reactionEmoji") or "").strip()
+            item_opt = chat_by_id.get(_text(event, "messageId") or "")
+            if item_opt is not None:
+                for reaction in item_opt.reactions:
+                    if (
+                        reaction.end is None
+                        and reaction.user_id == user_id
+                        and reaction.emoji == emoji
+                    ):
+                        reaction.end = timestamp
+                        changes.append(timestamp)
+                        break
 
         elif name == "ParticipantTalkingEvent":
             user_id = _text(event, "participant")
@@ -523,6 +735,8 @@ def parse_overlay_events(
                 message,
                 url=first_link(raw_message),
                 markup=chat_markup(raw_message),
+                reply_to=chat_by_id.get(_text(event, "replyToMessageId") or ""),
+                emphasized=(_text(event, "chatEmphasizedText") or "").lower() == "true",
             )
             items.append(item)
             message_id = _text(event, "messageId")
@@ -541,7 +755,79 @@ def parse_overlay_events(
         elif name == "DeletePublicChatMessageRecordEvent":
             item_opt = chat_by_id.pop(_text(event, "messageId") or "", None)
             if item_opt is not None:
+                # A deleted message is not shown at any moment of the video,
+                # and neither is it quoted or kept pinned
                 items.remove(item_opt)
+                deleted.add(id(item_opt))
+
+        elif name == "ClearPublicChatEvent":
+            # The messages go away for everybody, and so they do in the video
+            for item in items:
+                if item.kind == "chat" and item.end is None:
+                    item.end = timestamp
+            chat_by_id.clear()
+            unpin(timestamp)
+            items.append(ActivityItem("chat_clear", timestamp))
+            changes.append(timestamp)
+
+        elif name == "PinPublicChatMessageRecordEvent":
+            item_opt = chat_by_id.get(_text(event, "messageId") or "")
+            user_id = _text(event, "senderId") or ""
+            unpin(timestamp)
+            if item_opt is not None:
+                pinned.append(
+                    PinnedMessage(
+                        timestamp,
+                        length + 1,
+                        item_opt,
+                        users[user_id].name if user_id in users else "",
+                    )
+                )
+                changes.append(timestamp)
+
+        elif name == "UnpinPublicChatMessageRecordEvent":
+            unpin(timestamp)
+
+        elif name == "ActivateTimerEvent":
+            timer.append(
+                TimerState(
+                    timestamp,
+                    True,
+                    (_text(event, "stopwatch") or "").lower() == "true",
+                    (_text(event, "running") or "").lower() == "true",
+                    _milliseconds(_text(event, "time")),
+                    _milliseconds(_text(event, "accumulated")),
+                )
+            )
+
+        elif name == "DeactivateTimerEvent":
+            timer.append(TimerState(timestamp))
+
+        elif name == "StartTimerEvent":
+            timer_change(timestamp, running=True)
+
+        elif name == "StopTimerEvent":
+            timer_change(timestamp, running=False)
+            accumulated = _text(event, "accumulated")
+            if accumulated is not None:
+                timer[-1].accumulated = _milliseconds(accumulated)
+
+        elif name == "SwitchTimerEvent":
+            timer_change(
+                timestamp,
+                stopwatch=(_text(event, "stopwatch") or "").lower() == "true",
+                running=False,
+                accumulated=0.0,
+            )
+
+        elif name == "SetTimerEvent":
+            timer_change(timestamp, time=_milliseconds(_text(event, "time")))
+
+        elif name == "ResetTimerEvent":
+            timer_change(timestamp, accumulated=0.0)
+
+        elif name == "TimerEndedEvent":
+            timer_change(timestamp, running=False, accumulated=0.0)
 
         elif name == "PollPublishedRecordEvent":
             answers: List[PollAnswer] = []
@@ -580,9 +866,19 @@ def parse_overlay_events(
             items.append(
                 ActivityItem("external_video", timestamp, presenter, shared_by, url=url)
             )
+            stop_external_video(timestamp)
+            external_videos.append(ExternalVideo(timestamp, length + 1, url, shared_by))
+
+        elif name == "StopExternalVideoRecordEvent":
+            stop_external_video(timestamp)
 
     for user_id in list(talk_start):
         stop_talking(user_id, length)
+
+    for item in items:
+        if item.reply_to is not None and id(item.reply_to) in deleted:
+            item.reply_to = None
+    pinned = [entry for entry in pinned if id(entry.item) not in deleted]
 
     items.extend(_presence_items(presence, rejoin_grace))
     items.sort(key=lambda item: item.timestamp)
@@ -609,6 +905,10 @@ def parse_overlay_events(
         talk_intervals=_talk_intervals(talk_raw),
         participants=participants,
         items=[],
+        pinned=pinned,
+        external_videos=external_videos,
+        timer=timer,
+        changes=sorted(changes),
     )
     # What happened while the recording was paused is not part of the video
     overlay_events.items = [
